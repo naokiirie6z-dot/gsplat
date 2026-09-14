@@ -15,8 +15,9 @@
 
 """Camera models and rolling shutter utilities for GSplat.
 
-This module contains camera model implementations including perfect pinhole, OpenCV pinhole,
-OpenCV fisheye, and FTheta models, along with rolling shutter support.
+This module contains camera model implementations including perfect pinhole,
+orthographic, OpenCV pinhole, OpenCV fisheye, and FTheta models, along with
+rolling shutter support.
 """
 
 import math
@@ -239,14 +240,6 @@ def _pose_world_points_to_camera_ray(pose: Tensor, world_points: Tensor) -> Tens
 
 
 class _BaseCameraModel(ABC):
-    # Opt-in flag for camera models whose image-point x-axis wraps around
-    # (e.g. equirectangular panoramas, where x=0 and x=width are the same
-    # physical direction). Consumed by the UT sigma-point covariance
-    # estimation in _torch_impl_ut.py to avoid spurious variance blow-up for
-    # Gaussians near the seam. Mirrors CameraModel::has_periodic_image_x_axis
-    # in Cameras.cuh. False for every existing model.
-    has_periodic_image_x_axis: bool = False
-
     def __init__(
         self,
         width: int,
@@ -278,9 +271,9 @@ class _BaseCameraModel(ABC):
             Args:
             width: Image width (required for non-lidar models)
             height: Image height (required for non-lidar models)
-            camera_model: "pinhole", "fisheye", "ftheta", "lidar", or "equirectangular"
+            camera_model: "pinhole", "ortho", "fisheye", "ftheta", or "lidar"
             principal_points: Principal points [B, 2] (cx, cy) - required for non-lidar models
-            focal_lengths: Focal lengths [B, 2] (fx, fy) - required for pinhole and fisheye
+            focal_lengths: Focal lengths [B, 2] (fx, fy) - required for pinhole, ortho, and fisheye
             radial_coeffs: [B, 6] or [B, 4] radial distortion coefficients (pinhole/fisheye)
             tangential_coeffs: [B, 2] tangential distortion coefficients (pinhole only)
             thin_prism_coeffs: [B, 4] thin prism distortion coefficients (pinhole only)
@@ -352,6 +345,30 @@ class _BaseCameraModel(ABC):
                     rs_type=rs_type,
                 )
 
+        elif camera_model == "ortho":
+            if ftheta_coeffs is not None:
+                raise ValueError(
+                    "ortho camera model does not support ftheta_coeffs parameter"
+                )
+            if (
+                radial_coeffs is not None
+                or tangential_coeffs is not None
+                or thin_prism_coeffs is not None
+            ):
+                raise ValueError(
+                    "ortho camera model does not support radial_coeffs, tangential_coeffs, or thin_prism_coeffs parameters"
+                )
+            if focal_lengths is None:
+                raise ValueError("focal_lengths is required for ortho camera model")
+
+            return _OrthographicCameraModel(
+                focal_lengths=focal_lengths,
+                principal_points=principal_points,
+                width=width,
+                height=height,
+                rs_type=rs_type,
+            )
+
         elif camera_model == "fisheye":
             if ftheta_coeffs is not None:
                 raise ValueError(
@@ -398,36 +415,10 @@ class _BaseCameraModel(ABC):
                 dist_params=ftheta_coeffs,
             )
 
-        elif camera_model == "equirectangular":
-            if ftheta_coeffs is not None:
-                raise ValueError(
-                    "equirectangular camera model does not support ftheta_coeffs parameter"
-                )
-            if (
-                radial_coeffs is not None
-                or tangential_coeffs is not None
-                or thin_prism_coeffs is not None
-            ):
-                raise ValueError(
-                    "equirectangular camera model does not support radial_coeffs, "
-                    "tangential_coeffs, or thin_prism_coeffs parameters"
-                )
-            # NOTE: unlike ftheta, focal_lengths is *not* rejected here even if
-            # given: _torch_impl_ut.py always derives and passes focal_lengths
-            # from Ks for every camera model, so equirectangular must silently
-            # ignore it (it has no real focal length) rather than error out.
-
-            return _EquirectangularCameraModel(
-                principal_points=principal_points,
-                width=width,
-                height=height,
-                rs_type=rs_type,
-            )
-
         else:
             raise ValueError(
                 f"Unsupported camera model: {camera_model}. "
-                f"Supported: pinhole, fisheye, ftheta, lidar, equirectangular"
+                f"Supported: pinhole, ortho, fisheye, ftheta, lidar"
             )
 
     def shutter_relative_frame_time(
@@ -797,6 +788,140 @@ class _PerfectPinholeCameraModel(_BaseCameraModel):
         assert_shape("result", result, M + (3,))
         assert_shape("valid", valid, M)
         return result, valid
+
+
+class _OrthographicCameraModel(_BaseCameraModel):
+    def __init__(
+        self,
+        focal_lengths: Tensor,  # [B, 2]
+        principal_points: Tensor,  # [B, 2]
+        width: int,
+        height: int,
+        rs_type: RollingShutterType,
+    ):
+        # Preconditions
+        B = focal_lengths.shape[:-1]
+        assert_shape("focal_lengths", focal_lengths, B + (2,))
+        assert_shape("principal_points", principal_points, B + (2,))
+
+        super().__init__(width, height, rs_type)
+        self._focal_lengths = focal_lengths
+        self._principal_points = principal_points
+
+    @property
+    def focal_lengths(self) -> Tensor:
+        return self._focal_lengths
+
+    @property
+    def principal_points(self) -> Tensor:
+        return self._principal_points
+
+    def camera_ray_to_image_point(
+        self,
+        cam_point: Tensor,
+        margin_factor: float,
+    ) -> Tuple[Tensor, Tensor]:
+        # Preconditions
+        M = cam_point.shape[:-1]
+        assert_shape("cam_point", cam_point, M + (3,))
+
+        valid_depth = cam_point[..., 2] > 0.0
+
+        image_point = _project_to_image(
+            cam_point[..., :2],
+            self.focal_lengths[..., None, :],
+            self.principal_points[..., None, :],
+        )
+
+        image_point = torch.where(
+            valid_depth[..., None], image_point, torch.zeros_like(image_point)
+        )
+
+        valid_bounds = self.check_image_bounds(image_point, margin_factor)
+        valid = valid_depth & valid_bounds
+
+        # Postconditions
+        assert_shape("image_point", image_point, M + (2,))
+        assert_shape("valid", valid, M)
+
+        return image_point, valid
+
+    def image_point_to_camera_ray(
+        self,
+        image_point: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        # Preconditions
+        M = image_point.shape[:-1]
+        assert_shape("image_point", image_point, M + (2,))
+
+        camera_ray = torch.cat(
+            [
+                torch.zeros_like(image_point[..., :1]),
+                torch.zeros_like(image_point[..., :1]),
+                torch.ones_like(image_point[..., :1]),
+            ],
+            dim=-1,
+        )
+        valid = torch.full_like(image_point[..., 0], True, dtype=torch.bool)
+
+        # Postconditions
+        assert_shape("camera_ray", camera_ray, M + (3,))
+        assert_shape("valid", valid, M)
+
+        return camera_ray, valid
+
+    def image_point_to_world_ray_shutter_pose(
+        self,
+        image_point: Tensor,  # [B, M, 2]
+        shutter_pose_start: Tensor,  # [B, 7]
+        shutter_pose_end: Tensor,  # [B, 7]
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        # Preconditions
+        B = shutter_pose_start.shape[:-1]
+        M = (
+            (image_point.shape[-2],)
+            if image_point.ndim == shutter_pose_start.ndim + 1
+            else ()
+        )
+        assert_shape("image_point", image_point, B + M + (2,))
+        assert_shape("shutter_pose_start", shutter_pose_start, B + (7,))
+        assert_shape("shutter_pose_end", shutter_pose_end, B + (7,))
+
+        uv = _unproject_from_image(
+            image_point,
+            self.focal_lengths[..., None, :],
+            self.principal_points[..., None, :],
+        )
+
+        relative_time = self.shutter_relative_frame_time(image_point)
+        interpolated_pose = _interpolate_shutter_pose(
+            shutter_pose_start[..., None, :],
+            shutter_pose_end[..., None, :],
+            relative_time,
+        )
+
+        origin_cam = torch.cat([uv, torch.zeros_like(uv[..., :1])], dim=-1)
+        direction_cam = torch.cat(
+            [
+                torch.zeros_like(uv[..., :1]),
+                torch.zeros_like(uv[..., :1]),
+                torch.ones_like(uv[..., :1]),
+            ],
+            dim=-1,
+        )
+
+        t = interpolated_pose[..., :3]
+        q_inv = _quat_inverse(interpolated_pose[..., 3:])
+        world_ray_org = _quat_rotate(q_inv, origin_cam - t)
+        world_ray_dir = _quat_rotate(q_inv, direction_cam)
+        valid = torch.full_like(image_point[..., 0], True, dtype=torch.bool)
+
+        # Postconditions
+        assert_shape("world_ray_org", world_ray_org, B + M + (3,))
+        assert_shape("world_ray_dir", world_ray_dir, B + M + (3,))
+        assert_shape("valid", valid, B + M)
+
+        return world_ray_org, world_ray_dir, valid
 
 
 class _OpenCVPinholeCameraModel(_BaseCameraModel):
@@ -1349,7 +1474,7 @@ class _OpenCVFisheyeCameraModel(_BaseCameraModel):
             approx_poly_even,
             torch.zeros_like(k1[..., None]),  # [B,1] target value (zero)
             n_iterations=newton_iterations,
-        )  # [B,1]
+        )  # [B,1], [B,1]
         max_angle_k4_nonzero = max_angle_k4_nonzero.squeeze(-1)  # [B]
         converged = converged.squeeze(-1)  # [B]
 
@@ -1560,8 +1685,10 @@ class _OpenCVFisheyeCameraModel(_BaseCameraModel):
         # Check image bounds
         valid_bounds = self.check_image_bounds(image_point, margin_factor)  # [B,M]
 
-        # Mark FOV-clamped points as invalid
-        valid = valid & (theta <= self.max_angle[..., None]) & valid_bounds  # [B,M]
+        # Mark FOV-clamped points as invalid. Compare against the pre-clamp
+        # `theta_full`; comparing `theta` here would be a tautology because
+        # `theta = min(theta_full, max_angle)` above.
+        valid = valid & (theta_full < self.max_angle[..., None]) & valid_bounds  # [B,M]
 
         # Postconditions
         assert_shape("image_point", image_point, B + M + (2,))
@@ -1839,15 +1966,15 @@ class _FThetaCameraModel(_BaseCameraModel):
             margin_factor: Margin for image bounds checking
 
         Returns:
-            image_point: [M, 2] projected image coordinates
+            image_point: [M, 2] projected image coordinates. Only meaningful
+                where `valid` is True. Rays outside the `max_angle` cone are
+                still projected after being clamped to the cone, so invalid
+                entries contain plausible-looking coordinates, not sentinels.
             valid: [M] validity mask
         """
         # Preconditions
         M = cam_ray.shape[:-1]
         assert_shape("cam_ray", cam_ray, M + (3,))
-
-        # Points behind camera are invalid
-        not_behind_camera = cam_ray[..., 2] > 0.0  # [M]
 
         # Compute norm of xy components using numerically stable method
         cam_ray_xy_norm = _numerically_stable_norm2(
@@ -1874,18 +2001,24 @@ class _FThetaCameraModel(_BaseCameraModel):
         # Evaluate forward polynomial to get delta = f(θ)
         # Choice depends on which polynomial is the reference
         if self.reference_poly_type == FThetaPolynomialType.PIXELDIST_TO_ANGLE:
-            # Backward poly is reference: forward via Newton inverse
-            delta, converged = _eval_poly_inverse_horner_newton(
+            # Backward poly is reference: forward via Newton inverse. Newton's
+            # `converged` flag is too strict here (FP32 polynomial-eval noise
+            # floor on |dx| sits above the inner 1e-6 threshold for typical
+            # FTheta fits; ~3.5e-5 when δ is a pixel distance of a few
+            # hundred). Newton's `x` is FP32-accurate regardless, so we trust
+            # `delta` and do not gate validity on `_converged`.
+            delta, _converged = _eval_poly_inverse_horner_newton(
                 self.pixeldist_to_angle_poly,
                 self.dreference_poly,
                 self.angle_to_pixeldist_poly,
                 theta,  # [M]
                 n_iterations=self.newton_iterations,
-            )  # [M]
+            )  # [M], [M]
         else:
-            # Forward poly is reference: direct evaluation
+            # Forward poly is reference: direct evaluation. No Newton runs,
+            # so the projection is trivially converged.
             delta = self.angle_to_pixeldist_poly.eval_horner(theta)  # [M]
-            converged = torch.ones_like(delta, dtype=torch.bool)  # Always converged
+            _converged = torch.ones_like(delta, dtype=torch.bool)
 
         # Apply delta to normalized xy to get f(θ)-weighted 2D vectors
         # Then apply linear transform A = [[c, d], [e, 1]]
@@ -1911,17 +2044,10 @@ class _FThetaCameraModel(_BaseCameraModel):
         # Check image bounds (matches CUDA image_point_in_image_bounds_margin)
         valid_bounds = self.check_image_bounds(image_point, margin_factor)  # [M]
 
-        # Mark FOV-clamped points as invalid
-        # TODO: This isn't happening, we need to compare against theta_full (not clamped)!
-        valid = (
-            not_behind_camera
-            & converged
-            & (theta <= self.max_angle[..., None])
-            & valid_bounds
-        )
-
-        # Set to zero the image_points behind camera or that didn't converge.
-        image_point = image_point * (converged & not_behind_camera)[..., None]
+        # Mark FOV-clamped points as invalid. Compare against the pre-clamp
+        # `theta_full`; comparing `theta` here would be a tautology because
+        # `theta = min(theta_full, max_angle)` above.
+        valid = (theta_full < self.max_angle[..., None]) & valid_bounds
 
         # Postconditions
         assert_shape("image_point", image_point, M + (2,))
@@ -2032,105 +2158,6 @@ class _FThetaCameraModel(_BaseCameraModel):
         assert_shape("converged", converged, M)
 
         return camera_ray, converged
-
-
-class _EquirectangularCameraModel(_BaseCameraModel):
-    """Equirectangular (360-degree panorama) camera model.
-
-    Unlike every other camera model here, this one has no focal length,
-    principal point, or distortion: the projection is a pure function of
-    (x, y, width, height), matching COLMAP's EQUIRECTANGULAR camera model
-    (see CamRayFromImg in colmap/src/colmap/sensor/models.h and its inverse
-    spherical_img_from_cam in pycolmap's panorama.py). Every 3D ray direction
-    maps to *some* pixel (no cheirality cutoff), so unlike pinhole/fisheye
-    there is no "behind the camera" invalid case.
-    """
-
-    has_periodic_image_x_axis: bool = True
-
-    def __init__(
-        self,
-        principal_points: Tensor,  # [B, 2], unused — kept only for API symmetry
-        width: int,
-        height: int,
-        rs_type: RollingShutterType,
-    ):
-        super().__init__(width, height, rs_type)
-        # Pseudo focal length / principal point: not used by the projection
-        # math below, only so the generic .focal_lengths/.principal_points
-        # properties (used e.g. by test harnesses) return something of the
-        # right shape/device/dtype. Mirrors how _FThetaCameraModel derives an
-        # "effective" focal length rather than storing a real one.
-        self._principal_points = principal_points.new_tensor(
-            [width / 2.0, height / 2.0]
-        ).expand(principal_points.shape)
-        self._focal_lengths = principal_points.new_tensor(
-            [width / (2.0 * math.pi), width / (2.0 * math.pi)]
-        ).expand(principal_points.shape)
-
-    @property
-    def focal_lengths(self) -> Tensor:
-        return self._focal_lengths
-
-    @property
-    def principal_points(self) -> Tensor:
-        return self._principal_points
-
-    def camera_ray_to_image_point(
-        self,
-        cam_ray: Tensor,
-        margin_factor: float,
-    ) -> Tuple[Tensor, Tensor]:
-        # Preconditions
-        M = cam_ray.shape[:-1]
-        assert_shape("cam_ray", cam_ray, M + (3,))
-
-        x, y, z = cam_ray[..., 0], cam_ray[..., 1], cam_ray[..., 2]
-        yaw = torch.atan2(x, z)
-        pitch = -torch.atan2(y, torch.hypot(x, z))
-        u = (1.0 + yaw / math.pi) / 2.0
-        v = (1.0 - 2.0 * pitch / math.pi) / 2.0
-        image_point = torch.stack([u * self.width, v * self.height], dim=-1)
-
-        # Total projection (every direction maps to a valid pixel); still run
-        # the generic bounds check for interface consistency with every other
-        # model, even though it will essentially always pass.
-        valid = self.check_image_bounds(image_point, margin_factor)
-
-        # Postconditions
-        assert_shape("image_point", image_point, M + (2,))
-        assert_shape("valid", valid, M)
-
-        return image_point, valid
-
-    def image_point_to_camera_ray(
-        self,
-        image_point: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        # Preconditions
-        M = image_point.shape[:-1]
-        assert_shape("image_point", image_point, M + (2,))
-
-        x, y = image_point[..., 0], image_point[..., 1]
-        theta = 2.0 * math.pi * (x / self.width - 0.5)
-        phi = math.pi * (0.5 - y / self.height)
-        cos_phi = torch.cos(phi)
-        camera_ray = torch.stack(
-            [
-                cos_phi * torch.sin(theta),
-                -torch.sin(phi),
-                cos_phi * torch.cos(theta),
-            ],
-            dim=-1,
-        )
-        # Already unit-norm by construction; total, invertible map.
-        valid = torch.full_like(camera_ray[..., 0], True, dtype=torch.bool)
-
-        # Postconditions
-        assert_shape("camera_ray", camera_ray, M + (3,))
-        assert_shape("valid", valid, M)
-
-        return camera_ray, valid
 
 
 def _interpolate_shutter_pose(
