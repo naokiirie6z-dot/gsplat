@@ -147,9 +147,17 @@ class Parser:
             elif type_ == 5 or type_ == "OPENCV_FISHEYE":
                 params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
                 camtype = "fisheye"
-            assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {type_}"
+            elif type_ == 17 or type_ == "EQUIRECTANGULAR":
+                # 360 panorama: no focal length / principal point / distortion,
+                # so no params and no undistortion needed (see the `continue`
+                # on empty params in the undistortion loop below).
+                params = np.empty(0, dtype=np.float32)
+                camtype = "equirectangular"
+            assert camtype in (
+                "perspective",
+                "fisheye",
+                "equirectangular",
+            ), f"Only perspective, fisheye and equirectangular cameras are supported, got {type_}"
 
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)

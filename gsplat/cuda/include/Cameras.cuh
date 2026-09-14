@@ -333,6 +333,14 @@ template <class DerivedCameraModel> struct BaseCameraModel {
         const gsplat::extdist::BivariateWindshieldModelDeviceParams* external_distortion_params = nullptr;
     };
 
+    // Opt-in trait for camera models whose image-point x-axis wraps around
+    // (e.g. equirectangular panoramas, where x=0 and x=width are the same
+    // physical direction). Consumed by the UT sigma-point covariance
+    // estimation to avoid spurious variance blow-up for Gaussians near the
+    // seam. False for every existing model; shadow to true in a derived
+    // struct to opt in.
+    static constexpr bool has_periodic_image_x_axis = false;
+
     __host__ __device__ BaseCameraModel(
         const gsplat::extdist::BivariateWindshieldModelDeviceParams* ext_dist_params = nullptr)
         : external_distortion_params(ext_dist_params) {}
@@ -595,6 +603,67 @@ struct PerfectPinholeCameraModel : BaseCameraModel<PerfectPinholeCameraModel> {
 
         // Make sure ray is normalized
         return {camera_ray / length(camera_ray), true};
+    }
+};
+
+// Equirectangular (360-degree panorama) camera model. Unlike every other
+// model here, it has no focal length / principal point / distortion: the
+// projection is a pure function of (x, y, resolution), matching COLMAP's
+// EQUIRECTANGULAR camera model (see CamRayFromImg in
+// colmap/src/colmap/sensor/models.h and its inverse spherical_img_from_cam
+// in pycolmap's panorama.py). Every 3D ray direction maps to *some* pixel
+// (no cheirality cutoff), so there is no "behind the camera" invalid case.
+struct EquirectangularCameraModel : BaseCameraModel<EquirectangularCameraModel> {
+    using Base = BaseCameraModel<EquirectangularCameraModel>;
+
+    // No extra fields: resolution (from Base::Parameters) is all that's needed.
+    struct Parameters : Base::Parameters {};
+
+    // Sigma points near the seam (x=0 / x=width) must be unwrapped before
+    // computing sample covariance; see world_gaussian_to_image_gaussian_-
+    // unscented_transform_shutter_pose in this file.
+    static constexpr bool has_periodic_image_x_axis = true;
+
+    __device__ EquirectangularCameraModel(Parameters const &parameters)
+        : Base(parameters.external_distortion_params), parameters(parameters) {}
+
+    Parameters parameters;
+
+    // Local constant: math_constants.h (CUDART_PI_F) isn't included in this
+    // file, and the ad-hoc `#define PI` further below (Lidars section) is
+    // defined after this point in the translation unit.
+    static constexpr float kPi = 3.14159265358979323846f;
+
+    inline __device__ auto camera_ray_to_image_point_impl(
+        glm::fvec3 const &cam_ray, float margin_factor
+    ) const -> typename Base::ImagePointReturn {
+        // atan2f/hypotf (rather than raw division or asin) keep this
+        // well-defined at the poles: cam_ray.x == cam_ray.z == 0 gives
+        // atan2f(0,0) = 0 rather than NaN from 0/0.
+        float const yaw = atan2f(cam_ray.x, cam_ray.z);
+        float const pitch = -atan2f(cam_ray.y, hypotf(cam_ray.x, cam_ray.z));
+        float const u = (1.f + yaw * (1.f / kPi)) * 0.5f;
+        float const v = (1.f - 2.f * pitch * (1.f / kPi)) * 0.5f;
+        auto const image_point =
+            glm::fvec2{u * parameters.resolution[0], v * parameters.resolution[1]};
+
+        // Total projection (every direction is valid); still run the generic
+        // bounds check for interface consistency with every other model.
+        auto const valid = image_point_in_image_bounds_margin(
+            image_point, parameters.resolution, margin_factor
+        );
+
+        return {image_point, valid};
+    }
+
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point
+    ) const {
+        float const theta =
+            2.f * kPi * (image_point.x / parameters.resolution[0] - 0.5f);
+        float const phi = kPi * (0.5f - image_point.y / parameters.resolution[1]);
+        float const cphi = cosf(phi), sphi = sinf(phi);
+        // Already unit-norm by construction; total, invertible map.
+        return {glm::fvec3{cphi * sinf(theta), -sphi, cphi * cosf(theta)}, true};
     }
 };
 
@@ -1463,6 +1532,24 @@ world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
         }
         image_points[i] = {image_point.x, image_point.y};
 
+        if constexpr (CameraModel::has_periodic_image_x_axis) {
+            // Sigma points other than the mean (i=0) can land on the far
+            // side of a periodic x-axis seam (e.g. equirectangular's
+            // longitude wrap at x=0/x=width). Unwrap this point's x to the
+            // branch nearest sigma point 0's projection before it feeds into
+            // the mean/covariance accumulation below, so a seam crossing
+            // doesn't inflate the estimated covariance. This only limits the
+            // variance blow-up; it does not make a footprint that genuinely
+            // straddles the seam rasterize on both sides (known v1 limitation).
+            if (i > 0) {
+                float const period =
+                    static_cast<float>(camera_model.parameters.resolution[0]);
+                image_points[i].x -=
+                    period *
+                    roundf((image_points[i].x - image_points[0].x) / period);
+            }
+        }
+
         image_mean += sigma_points.weights_mean[i] * image_points[i];
     }
 
@@ -1476,6 +1563,15 @@ world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
         auto const image_mean_vec = image_points[i] - image_mean;
         image_covariance += sigma_points.weights_covariance[i] *
                             glm::outerProduct(image_mean_vec, image_mean_vec);
+    }
+
+    if constexpr (CameraModel::has_periodic_image_x_axis) {
+        // image_mean was accumulated in the unwrapped domain above (and may
+        // now sit slightly outside [0, width)); wrap it back into the
+        // canonical pixel range expected by the tile-based rasterizer.
+        float const period =
+            static_cast<float>(camera_model.parameters.resolution[0]);
+        image_mean.x -= period * floorf(image_mean.x / period);
     }
 
     return {image_mean, image_covariance, valid};

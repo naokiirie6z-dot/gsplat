@@ -34,7 +34,9 @@ from gsplat.cuda._lidar import (
 )
 
 ExternalDistortionModelMeta = Literal["bivariate-windshield"]
-CameraModel = Literal["pinhole", "ortho", "fisheye", "ftheta", "lidar"]
+CameraModel = Literal[
+    "pinhole", "ortho", "fisheye", "ftheta", "lidar", "equirectangular"
+]
 
 
 def _make_lazy_cuda_func(name: str) -> Callable:
@@ -470,9 +472,10 @@ def proj(
         - **Projected means**. [..., C, N, 2]
         - **Projected covariances**. [..., C, N, 2, 2]
     """
-    assert (
-        camera_model != "ftheta"
-    ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+    assert camera_model not in (
+        "ftheta",
+        "equirectangular",
+    ), f"{camera_model} camera is only supported via UT, please set with_ut=True in the rasterization()"
 
     batch_dims = means.shape[:-3]
     C, N = means.shape[-3:-1]
@@ -595,9 +598,10 @@ def fully_fused_projection(
         assert opacities.shape == batch_dims + (N,), opacities.shape
         opacities = opacities.contiguous()
 
-    assert (
-        camera_model != "ftheta"
-    ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+    assert camera_model not in (
+        "ftheta",
+        "equirectangular",
+    ), f"{camera_model} camera is only supported via UT, please set with_ut=True in the rasterization()"
 
     viewmats = viewmats.contiguous()
     Ks = Ks.contiguous()
@@ -1424,9 +1428,10 @@ class _Proj(torch.autograd.Function):
         height: int,
         camera_model: CameraModel = "pinhole",
     ) -> Tuple[Tensor, Tensor]:
-        assert (
-            camera_model != "ftheta"
-        ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+        assert camera_model not in (
+            "ftheta",
+            "equirectangular",
+        ), f"{camera_model} camera is only supported via UT, please set with_ut=True in the rasterization()"
 
         camera_model_type = _make_lazy_cuda_obj(
             f"CameraModelType.{camera_model.upper()}"
@@ -1494,9 +1499,10 @@ class _FullyFusedProjection(torch.autograd.Function):
         camera_model: CameraModel = "pinhole",
         opacities: Optional[Tensor] = None,  # [..., N] or None
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        assert (
-            camera_model != "ftheta"
-        ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+        assert camera_model not in (
+            "ftheta",
+            "equirectangular",
+        ), f"{camera_model} camera is only supported via UT, please set with_ut=True in the rasterization()"
 
         camera_model_type = _make_lazy_cuda_obj(
             f"CameraModelType.{camera_model.upper()}"
@@ -2138,9 +2144,10 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
         camera_model: CameraModel = "pinhole",
         opacities: Optional[Tensor] = None,  # [..., N] or None
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        assert (
-            camera_model != "ftheta"
-        ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+        assert camera_model not in (
+            "ftheta",
+            "equirectangular",
+        ), f"{camera_model} camera is only supported via UT, please set with_ut=True in the rasterization()"
 
         camera_model_type = _make_lazy_cuda_obj(
             f"CameraModelType.{camera_model.upper()}"

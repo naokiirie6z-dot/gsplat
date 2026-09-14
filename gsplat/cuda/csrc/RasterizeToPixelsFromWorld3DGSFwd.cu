@@ -226,6 +226,14 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
             assert(lidar_device_coeffs);
             ray = RowOffsetStructuredSpinningLidarModel(*lidar_device_coeffs).element_to_world_ray_shutter_pose(j, i, rs_params);
         }
+        else if (camera_model_type == CameraModelType::EQUIRECTANGULAR) {
+            EquirectangularCameraModel::Parameters cm_params = {};
+            cm_params.resolution = {image_width, image_height};
+            cm_params.shutter_type = rs_type;
+            cm_params.external_distortion_params = external_distortion_device_params.has_value() ?
+                &external_distortion_device_params.value() : nullptr;
+            ray = EquirectangularCameraModel(cm_params).element_to_world_ray_shutter_pose(j, i, rs_params);
+        }
         else {
             assert(false);
             return;

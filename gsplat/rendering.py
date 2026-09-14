@@ -462,7 +462,14 @@ def rasterization(
             The input Gaussians are expected to be a subset of scene in each rank, and
             the function will collaboratively render the images for all ranks.
         camera_model: The camera model to use. Supported models are "pinhole", "ortho",
-            "fisheye", and "ftheta". Default is "pinhole".
+            "fisheye", "ftheta", "lidar", and "equirectangular". Default is "pinhole".
+            "equirectangular" (360 panorama) has no focal length / principal point;
+            `Ks` is still required for shape purposes but its numeric content is
+            ignored, and it is only supported via UT (`with_ut=True`). Since it is
+            omnidirectional (not forward-facing), also pass `global_z_order=False`
+            — otherwise the default forward-facing near/far-plane culling (based on
+            raw camera-space z) will incorrectly discard Gaussians behind the camera
+            (z <= 0), which are perfectly valid for a 360 camera.
         segmented: Whether to use segmented radix sort. Default is False.
             Segmented radix sort performs sorting in segments, which is more efficient for the sorting operation itself.
             However, since it requires offset indices as input, additional global memory access is needed, which results
@@ -584,6 +591,11 @@ def rasterization(
     assert (camera_model == "lidar") == (
         lidar_coeffs is not None
     ), "Lidar coefficients must be given if and only if camera model is lidar"
+    assert camera_model != "equirectangular" or not global_z_order, (
+        "equirectangular is omnidirectional (not forward-facing): the default "
+        "near/far-plane culling based on raw camera-space z would incorrectly "
+        "discard Gaussians behind the camera. Pass global_z_order=False."
+    )
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(

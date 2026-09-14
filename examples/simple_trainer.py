@@ -711,6 +711,16 @@ class Runner:
                     .unsqueeze(0)
                 )
 
+        global_z_order = True
+        if camera_model == "equirectangular":
+            # Equirectangular is UT-only and omnidirectional (not
+            # forward-facing): both are hard requirements enforced by
+            # rasterization()'s asserts, not optional knobs, so set them
+            # here rather than relying on the caller to remember extra CLI
+            # flags (mirrors examples/av_trainer.py's lidar call).
+            with_ut = True
+            global_z_order = False
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -732,6 +742,7 @@ class Runner:
             distributed=self.world_size > 1,
             camera_model=camera_model,
             with_ut=with_ut,
+            global_z_order=global_z_order,
             with_eval3d=self.cfg.with_eval3d,
             ftheta_coeffs=ftheta_coeffs,
             radial_coeffs=radial_coeffs,

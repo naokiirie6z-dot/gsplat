@@ -41,6 +41,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .value("FISHEYE", gsplat::CameraModelType::FISHEYE)
         .value("FTHETA", gsplat::CameraModelType::FTHETA)
         .value("LIDAR", gsplat::CameraModelType::LIDAR)
+        .value("EQUIRECTANGULAR", gsplat::CameraModelType::EQUIRECTANGULAR)
         .export_values();
 
     py::enum_<gsplat::extdist::ModelType>(m, "ExternalDistortionModelType", py::module_local())
@@ -521,6 +522,25 @@ TORCH_LIBRARY(gsplat, m) {
             {torch::arg("width"),
              torch::arg("height"),
              torch::arg("focal_lengths"),
+             torch::arg("principal_points"),
+             torch::arg("rs_type"),
+             torch::arg("external_distortion_coeffs")}
+        );
+
+    m.class_<gsplat::PyEquirectangularCameraModel>("EquirectangularCameraModel")
+        .def(
+            torch::init([](int64_t width,
+                           int64_t height,
+                           const torch::Tensor &principal_points,
+                           int64_t rs_type,
+                           const std::optional<c10::intrusive_ptr<gsplat::extdist::BivariateWindshieldModelParameters>> &external_distortion_coeffs) {
+                return c10::make_intrusive<gsplat::PyEquirectangularCameraModel>(
+                    width, height, principal_points, static_cast<ShutterType>(rs_type), external_distortion_coeffs
+                );
+            }),
+            "Constructor",
+            {torch::arg("width"),
+             torch::arg("height"),
              torch::arg("principal_points"),
              torch::arg("rs_type"),
              torch::arg("external_distortion_coeffs")}

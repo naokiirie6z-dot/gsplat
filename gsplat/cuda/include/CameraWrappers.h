@@ -345,6 +345,31 @@ public:
 };
 
 /**
+ * @brief Equirectangular (360-degree panorama) camera model
+ */
+class PyEquirectangularCameraModel : public PyBaseCameraModel<EquirectangularCameraModel>
+{
+public:
+    /**
+     * @brief Constructor (no K matrix / focal length - resolution fully determines the projection)
+     * @param width Image width in pixels
+     * @param height Image height in pixels
+     * @param principal_points Principal points [..., 2] - unused by the projection, kept only
+     *        as the source of the per-batch shape/device/dtype (mirrors _torch_cameras.py's
+     *        _EquirectangularCameraModel, which is likewise given but ignores this value)
+     * @param shutter_type Rolling shutter type
+     * @param external_distortion_coeffs Optional bivariate windshield model distortion parameters
+     */
+    PyEquirectangularCameraModel(
+        int width,
+        int height,
+        const torch::Tensor& principal_points,
+        ShutterType rs_type,
+        const std::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>>& external_distortion_coeffs
+    );
+};
+
+/**
  * @brief Lidar camera model for spinning lidar sensors
  */
 class PyRowOffsetStructuredSpinningLidarModel : public PyBaseCameraModel<RowOffsetStructuredSpinningLidarModel>

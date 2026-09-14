@@ -209,6 +209,19 @@ __global__ void projection_ut_3dgs_fused_kernel(
         image_gaussian_return =
             world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
                 camera_model, rs_params, ut_params, mean, scale, quat);
+    } else if (camera_model_type == CameraModelType::EQUIRECTANGULAR) {
+        // No focal_length / principal_point: equirectangular's projection is
+        // a pure function of resolution, so the Ks-derived values above are
+        // simply unused here (same pattern as FTHETA ignoring focal_length).
+        EquirectangularCameraModel::Parameters cm_params = {};
+        cm_params.resolution = {image_width, image_height};
+        cm_params.shutter_type = rs_type;
+        cm_params.external_distortion_params = external_distortion_device_params.has_value() ?
+            &external_distortion_device_params.value() : nullptr;
+        EquirectangularCameraModel camera_model(cm_params);
+        image_gaussian_return =
+            world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
+                camera_model, rs_params, ut_params, mean, scale, quat);
     } else {
         // should never reach here
         assert(false);

@@ -232,6 +232,19 @@ c10::intrusive_ptr<PyBaseCameraModel<>> PyBaseCameraModel<>::create(
             external_distortion_coeffs
         );
     }
+    else if (camera_model == "equirectangular")
+    {
+        TORCH_CHECK_ARG(!ftheta_coeffs, "ftheta_coeffs", "not allowed for equirectangular camera model");
+        TORCH_CHECK_ARG(!radial_coeffs, "radial_coeffs", "not allowed for equirectangular camera model");
+        TORCH_CHECK_ARG(!tangential_coeffs, "tangential_coeffs", "not allowed for equirectangular camera model");
+        TORCH_CHECK_ARG(!thin_prism_coeffs, "thin_prism_coeffs", "not allowed for equirectangular camera model");
+        // NOTE: unlike ftheta, focal_lengths is *not* rejected here even if given
+        // (it is simply ignored) - some callers derive and pass it unconditionally.
+
+        return c10::make_intrusive<PyEquirectangularCameraModel>(
+            width, height, principal_points, rs_type, external_distortion_coeffs
+        );
+    }
     // TODO: Lidar camera model is not supported through the generic create() method.
     // This needs to be added.
     // For now, use PyRowOffsetStructuredSpinningLidarModel constructor directly with all required parameters.
@@ -730,6 +743,70 @@ PyPerfectPinholeCameraModel::PyPerfectPinholeCameraModel(
         make_tensor_view<CAMERA>(this->dev_cameras(), {m_num_cameras}, {1}, "cameras"),
         make_tensor_view<const float, CAMERA, 2>(focal_lengths, m_num_cameras, "focal_lengths"),
         make_tensor_view<const float, CAMERA, 2>(principal_points, m_num_cameras, "principal_points"),
+        m_width, m_height, m_rs_type,
+        dev_ext_dist_params()
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ====================== PyEquirectangularCameraModel Implementation ========================
+
+/**
+ * @brief Constructor kernel for equirectangular cameras
+ *
+ * Grid: (num_cameras/256, 1, 1)
+ * Block: (256, 1, 1)
+ * One thread per camera. Unlike pinhole/fisheye/ftheta, no focal_lengths /
+ * principal_points are read here: the projection is a pure function of
+ * resolution.
+ */
+__global__ void construct_equirectangular_cameras_kernel(
+    TensorView<EquirectangularCameraModel, CAMERA> cameras,
+    int width, int height, ShutterType rs_type,
+    const gsplat::extdist::BivariateWindshieldModelDeviceParams* ext_dist_params
+)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= cameras.shape(0))
+    {
+        return;
+    }
+
+    EquirectangularCameraModel::Parameters params;
+    params.resolution = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+    params.shutter_type = rs_type;
+    params.external_distortion_params = ext_dist_params;
+
+    // Construct camera in-place
+    new (&cameras(idx)) EquirectangularCameraModel(params);
+}
+
+
+PyEquirectangularCameraModel::PyEquirectangularCameraModel(
+    int width, int height,
+    const torch::Tensor& principal_points,
+    ShutterType rs_type,
+    const std::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>>& external_distortion_coeffs
+) : PyBaseCameraModel(
+        normalize_shape<CAMERA, 2>(principal_points).size(0), width, height, rs_type,
+        // Pseudo focal length so the base class has a real (if physically
+        // meaningless) tensor to store for the generic .focal_lengths()
+        // accessor; mirrors _EquirectangularCameraModel's Torch reference.
+        /*focal_lengths=*/torch::full_like(
+            principal_points, static_cast<float>(width) / (2.0f * 3.14159265358979323846f)
+        ),
+        /*principal_points=*/principal_points)
+{
+    if (external_distortion_coeffs)
+        init_external_distortion(*external_distortion_coeffs.value());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(principal_points.device().index());
+
+    int threads = 256;
+    int blocks = (m_num_cameras + threads - 1) / threads;
+
+    construct_equirectangular_cameras_kernel<<<blocks, threads, 0, stream>>>(
+        make_tensor_view<CAMERA>(this->dev_cameras(), {m_num_cameras}, {1}, "cameras"),
         m_width, m_height, m_rs_type,
         dev_ext_dist_params()
     );

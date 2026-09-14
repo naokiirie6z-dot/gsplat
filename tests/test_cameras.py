@@ -53,6 +53,7 @@ from gsplat.cuda._torch_cameras import (  # PyTorch reference
     _OpenCVPinholeCameraModel,
     _OpenCVFisheyeCameraModel,
     _FThetaCameraModel,
+    _EquirectangularCameraModel,
 )
 from gsplat.cuda._torch_lidars import (  # PyTorch reference
     _RowOffsetStructuredSpinningLidarModel,
@@ -92,6 +93,7 @@ CAMERA_MODELS = [
     "ftheta[p2a]",
     "lidar[pandar128]",
     "lidar[at128]",
+    "equirectangular",
 ]
 
 ROLLING_SHUTTER_TYPES = [
@@ -169,6 +171,8 @@ def parse_camera(
         camera_parser = parse_ftheta_camera
     elif model_type == "lidar":
         camera_parser = parse_lidar_camera
+    elif model_type == "equirectangular":
+        camera_parser = parse_equirectangular_camera
     else:
         raise ValueError(f"Unknown camera model: {model_type}")
 
@@ -211,6 +215,19 @@ def parse_perfect_pinhole_camera(
     focal_lengths = torch.stack([focal_length_x, focal_length_y], dim=-1)
 
     return {"focal_lengths": focal_lengths}
+
+
+def parse_equirectangular_camera(
+    param_str: str, batch_dims: tuple, width: int, height: int, device: torch.device
+):
+    """Parse parameters for the equirectangular (360 panorama) camera model.
+
+    Unlike every other model, equirectangular has no real intrinsics - the
+    projection is a pure function of (x, y, width, height). parse_camera()'s
+    common tail still injects `principal_points` for shape/API consistency,
+    but create_camera_model()/_BaseCameraModel.create() ignore it.
+    """
+    return {}
 
 
 def parse_opencv_pinhole_camera(
@@ -774,6 +791,13 @@ class TestCameraModels:
             atol, rtol = 1.9e-05, 2.5e-07
         elif isinstance(ref_camera, _RowOffsetStructuredSpinningLidarModel):
             atol, rtol = 5e-03, 5e-03
+        elif isinstance(ref_camera, _EquirectangularCameraModel):
+            # equirectangular: closed-form trig (atan2/hypot), no iterative
+            # solve, similar in spirit to perfect pinhole. Not yet calibrated
+            # against observed CUDA-vs-Torch numbers in this environment
+            # (CameraWrappers doesn't build here, see Cameras.cuh/CameraWrappers.cu
+            # changes); kept conservative pending calibration elsewhere.
+            atol, rtol = 1e-04, 1e-04
         else:  # Fallback
             atol, rtol = None, None
         assert_close(test_imgpt[all_valid], ref_imgpt[all_valid], atol=atol, rtol=rtol)
@@ -791,6 +815,12 @@ class TestCameraModels:
             validity_tol = 2.5e-03  # 0.25%
         elif isinstance(ref_camera, _PerfectPinholeCameraModel):
             validity_tol = 1e-05  # 0.001% for perfect pinhole
+        elif isinstance(ref_camera, _EquirectangularCameraModel):
+            # Total projection (no cheirality cutoff), but exact-boundary
+            # cases at the seam (x=0/width) and poles can flip valid/invalid
+            # between CUDA and Torch due to float rounding; not yet
+            # calibrated (see note in test_camera_ray_to_image_point).
+            validity_tol = 1e-03
         else:
             validity_tol = 1e-03  # Fallback
 
@@ -818,6 +848,10 @@ class TestCameraModels:
         elif isinstance(ref_camera, _PerfectPinholeCameraModel):
             # perfect pinhole: observed atol=1.19e-07, rtol=2.37e-07
             atol, rtol = 1.5e-07, 3e-07
+        elif isinstance(ref_camera, _EquirectangularCameraModel):
+            # equirectangular: closed-form trig, not yet calibrated in this
+            # environment (see note in test_camera_ray_to_image_point).
+            atol, rtol = 1e-05, 1e-05
         else:  # Fallback
             atol, rtol = 1.65e-04, 1.25
         assert_close(test_rays[all_valid], ref_rays[all_valid], atol=atol, rtol=rtol)
@@ -836,6 +870,8 @@ class TestCameraModels:
             validity_tol = 1e-04  # 0.01%
         elif isinstance(ref_camera, _PerfectPinholeCameraModel):
             validity_tol = 1e-05  # 0.001% for perfect pinhole
+        elif isinstance(ref_camera, _EquirectangularCameraModel):
+            validity_tol = 1e-03  # see note in test_camera_ray_to_image_point
         else:
             validity_tol = 3e-02  # Fallback
         assert_mismatch_ratio(test_valid, ref_valid, max=validity_tol)

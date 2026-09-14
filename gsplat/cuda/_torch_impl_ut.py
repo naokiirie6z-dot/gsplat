@@ -220,6 +220,21 @@ def _world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
     points_2d = points_2d_flat.reshape(B + (C, N, 7, 2))
     valid_points = valid_flat.reshape(B + (C, N, 7))
 
+    if getattr(camera, "has_periodic_image_x_axis", False):
+        # Sigma points other than the mean (index 0) can land on the far side
+        # of a periodic x-axis seam (e.g. equirectangular's longitude wrap at
+        # x=0/x=width). Unwrap each point's x to the branch nearest sigma
+        # point 0's projection before it feeds into mean/covariance below, so
+        # a seam crossing doesn't inflate the estimated covariance. Mirrors
+        # the CUDA-side fix in Cameras.cuh's
+        # world_gaussian_to_image_gaussian_unscented_transform_shutter_pose.
+        period = float(camera.width)
+        x = points_2d[..., 0]  # [B, C, N, 7]
+        y = points_2d[..., 1]
+        x0 = x[..., 0:1]  # sigma point 0, broadcasts against the 7-dim
+        x_unwrapped = x - period * torch.round((x - x0) / period)
+        points_2d = torch.stack([x_unwrapped, y], dim=-1)
+
     # Compute weighted mean and covariance for each Gaussian
 
     if ut_params.require_all_sigma_points_valid:
@@ -275,6 +290,16 @@ def _world_gaussian_to_image_gaussian_unscented_transform_shutter_pose(
         )  # [..., C, N, 2, 2]
     else:
         cov_2d = torch.einsum("i,...nijk->...njk", weights_cov, outer_products)
+
+    if getattr(camera, "has_periodic_image_x_axis", False):
+        # mean_2d was accumulated in the unwrapped domain above (and may now
+        # sit slightly outside [0, width)); wrap it back into the canonical
+        # pixel range. Done after cov_2d so the covariance is computed in the
+        # same unwrapped domain as points_2d (matching the CUDA order).
+        period = float(camera.width)
+        x_mean = mean_2d[..., 0]
+        x_mean_wrapped = x_mean - period * torch.floor(x_mean / period)
+        mean_2d = torch.stack([x_mean_wrapped, mean_2d[..., 1]], dim=-1)
 
     return mean_2d, cov_2d, valid_gaussian
 
@@ -399,10 +424,16 @@ def _fully_fused_projection_with_ut(
     assert Ks.dtype == torch.float32, f"Ks must be float32, got {Ks.dtype}"
 
     # Validate camera model support
-    if camera_model not in ["pinhole", "fisheye", "ftheta", "lidar"]:
+    if camera_model not in [
+        "pinhole",
+        "fisheye",
+        "ftheta",
+        "lidar",
+        "equirectangular",
+    ]:
         raise ValueError(
             f"Camera model '{camera_model}' not supported in UT projection. "
-            f"UT supports: pinhole, fisheye, ftheta. "
+            f"UT supports: pinhole, fisheye, ftheta, lidar, equirectangular. "
             f"For ortho, use non-UT projection (with_ut=False)."
         )
 
@@ -464,9 +495,14 @@ def _fully_fused_projection_with_ut(
     )  # [B, C, N, 3]
 
     # Check if Gaussian center is within frustum.
-    # Use transformed center point (means_cam) for depth check
+    # Use transformed center point (means_cam) for depth check.
+    # Matches the CUDA projection kernel: for global_z_order=False (used by
+    # omnidirectional sensors like equirectangular/lidar, which have no single
+    # forward axis), cull on Euclidean distance rather than raw camera-space
+    # z, so Gaussians behind the camera (z <= 0) aren't wrongly discarded.
     center_z = means_cam[..., 2]  # [B, C, N]
-    in_frustum = (center_z >= near_plane) & (center_z <= far_plane)
+    cull_depth = center_z if global_z_order else torch.norm(means_cam, dim=-1)
+    in_frustum = (cull_depth >= near_plane) & (cull_depth <= far_plane)
 
     # Cull degenerate Gaussians: zero-length quaternion (no defined orientation)
     # or near-zero scale on any axis (divergent precision matrix in rasterization).

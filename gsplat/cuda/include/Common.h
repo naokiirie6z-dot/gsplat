@@ -68,6 +68,7 @@ enum CameraModelType {
     FISHEYE = 2,
     FTHETA = 3,
     LIDAR = 4,
+    EQUIRECTANGULAR = 5,
 };
 
 #define N_THREADS_PACKED 256
