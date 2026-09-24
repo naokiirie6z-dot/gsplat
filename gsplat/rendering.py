@@ -443,7 +443,12 @@ def rasterization(
             The input Gaussians are expected to be a subset of scene in each rank, and
             the function will collaboratively render the images for all ranks.
         camera_model: The camera model to use. Supported models are "pinhole", "ortho",
-            "fisheye", and "ftheta". Default is "pinhole".
+            "fisheye", "ftheta", "lidar", and "equirectangular". Default is "pinhole".
+            "equirectangular" (360 panorama) has no focal length / principal point;
+            `Ks` is still required for shape purposes but its numeric content is
+            ignored. It is only supported via UT (`with_ut=True`), and being
+            omnidirectional (not forward-facing), typically also needs
+            `global_z_order=False` so Gaussians behind the camera aren't dropped.
         segmented: Whether to use segmented radix sort. Default is False.
             Segmented radix sort performs sorting in segments, which is more efficient for the sorting operation itself.
             However, since it requires offset indices as input, additional global memory access is needed, which results

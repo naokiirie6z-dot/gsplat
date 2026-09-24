@@ -101,9 +101,14 @@ def _camera_distortion(camera: Any) -> tuple[np.ndarray, str]:
         return np.array(params[4:8], dtype=np.float32), "perspective"
     if model_name == "OPENCV_FISHEYE":
         return np.array(params[4:8], dtype=np.float32), "fisheye"
+    if model_name == "EQUIRECTANGULAR":
+        # 360 panorama: no focal length / principal point / distortion, so no
+        # params and no undistortion needed (see the `continue` on empty
+        # params in the undistortion loop below).
+        return np.empty(0, dtype=np.float32), "equirectangular"
 
     raise ValueError(
-        f"Only perspective and fisheye cameras are supported, got {model_name}"
+        f"Only perspective, fisheye, and equirectangular cameras are supported, got {model_name}"
     )
 
 
@@ -165,7 +170,17 @@ class Parser:
 
             # camera intrinsics
             cam = cameras[camera_id]
-            K = np.asarray(cam.calibration_matrix(), dtype=np.float64)
+            if _camera_model_name(cam) == "EQUIRECTANGULAR":
+                # calibration_matrix() is only defined for perspective cameras
+                # (COLMAP raises); equirectangular has no focal length /
+                # principal point, so this K is a placeholder for shape
+                # purposes only and is never used by the projection math.
+                K = np.array(
+                    [[1.0, 0.0, cam.width / 2.0], [0.0, 1.0, cam.height / 2.0], [0.0, 0.0, 1.0]],
+                    dtype=np.float64,
+                )
+            else:
+                K = np.asarray(cam.calibration_matrix(), dtype=np.float64)
             K[:2, :] /= factor
             Ks_dict[camera_id] = K
 

@@ -459,6 +459,14 @@ struct BaseCameraModel
         bool valid_flag;
     };
 
+    // Opt-in trait for camera models whose image-point x-axis wraps around
+    // (e.g. equirectangular panoramas, where x=0 and x=width are the same
+    // physical direction). Consumed by the UT sigma-point covariance
+    // estimation to avoid spurious variance blow-up for Gaussians near the
+    // seam. False for every existing model; shadow to true in a derived
+    // struct to opt in.
+    static constexpr bool has_periodic_image_x_axis = false;
+
     // Apply external distortion before camera projection (forward)
     inline __device__ auto camera_ray_to_image_point(const glm::fvec3 &cam_ray, float margin_factor) const
         -> ImagePointReturn
@@ -722,6 +730,80 @@ struct PerfectPinholeCameraModel
 
         // Make sure ray is normalized
         return {camera_ray / length(camera_ray), true};
+    }
+};
+
+// Equirectangular (360-degree panorama) camera model. Unlike every other
+// model here, it has no focal length / principal point / distortion: the
+// projection is a pure function of (x, y, resolution), matching COLMAP's
+// EQUIRECTANGULAR camera model (see CamRayFromImg in
+// colmap/src/colmap/sensor/models.h and its inverse spherical_img_from_cam
+// in pycolmap's panorama.py). Every 3D ray direction maps to *some* pixel
+// (no cheirality cutoff), so there is no "behind the camera" invalid case.
+template<typename ExternalDistortionModel>
+struct EquirectangularCameraModel
+    : BaseCameraModel<EquirectangularCameraModel<ExternalDistortionModel>, ExternalDistortionModel>
+{
+    using Base = BaseCameraModel<EquirectangularCameraModel, ExternalDistortionModel>;
+
+    // No extra fields: resolution (from Base::KernelParameters/Parameters)
+    // is all that's needed.
+    struct KernelParameters : Base::KernelParameters
+    {
+    };
+
+    struct Parameters : Base::Parameters
+    {
+        inline __device__ Parameters(const KernelParameters &kernel_parameters, int camera_index)
+            : Base::Parameters(kernel_parameters, camera_index)
+        {
+        }
+    };
+
+    // Sigma points near the seam (x=0 / x=width) must be unwrapped before
+    // computing sample covariance; see
+    // world_gaussian_to_image_gaussian_unscented_transform_shutter_pose
+    // in this file.
+    static constexpr bool has_periodic_image_x_axis = true;
+
+    inline __device__ EquirectangularCameraModel(const KernelParameters &kernel_parameters, int camera_index)
+        : parameters(kernel_parameters, camera_index)
+    {
+    }
+
+    Parameters parameters;
+
+    // math_constants.h isn't included in this file, so use a local constant
+    // rather than CUDART_PI_F.
+    static constexpr float kPi = 3.14159265358979323846f;
+
+    inline __device__ auto camera_ray_to_image_point_impl(const glm::fvec3 &cam_ray, float margin_factor) const ->
+        typename Base::ImagePointReturn
+    {
+        // atan2f/hypotf (rather than raw division or asin) keep this
+        // well-defined at the poles: cam_ray.x == cam_ray.z == 0 gives
+        // atan2f(0,0) = 0 rather than NaN from 0/0.
+        const float yaw   = atan2f(cam_ray.x, cam_ray.z);
+        const float pitch = -atan2f(cam_ray.y, hypotf(cam_ray.x, cam_ray.z));
+        const float u     = (1.f + yaw * (1.f / kPi)) * 0.5f;
+        const float v     = (1.f - 2.f * pitch * (1.f / kPi)) * 0.5f;
+        const auto image_point
+            = glm::fvec2{u * parameters.resolution[0], v * parameters.resolution[1]};
+
+        // Total projection (every direction is valid); still run the generic
+        // bounds check for interface consistency with every other model.
+        const auto valid = image_point_in_image_bounds_margin(image_point, parameters.resolution, margin_factor);
+
+        return {image_point, valid};
+    }
+
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point) const
+    {
+        const float theta = 2.f * kPi * (image_point.x / parameters.resolution[0] - 0.5f);
+        const float phi   = kPi * (0.5f - image_point.y / parameters.resolution[1]);
+        const float cphi = cosf(phi), sphi = sinf(phi);
+        // Already unit-norm by construction; total, invertible map.
+        return {glm::fvec3{cphi * sinf(theta), -sphi, cphi * cosf(theta)}, true};
     }
 };
 
@@ -1913,6 +1995,24 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
             valid |= point_valid; // any valid is sufficient
         }
         image_points[i]  = {image_point.x, image_point.y};
+
+        if constexpr(CameraModel::has_periodic_image_x_axis)
+        {
+            // Sigma points other than the mean (i=0) can land on the far
+            // side of a periodic x-axis seam (e.g. equirectangular's
+            // longitude wrap at x=0/x=width). Unwrap this point's x to the
+            // branch nearest sigma point 0's projection before it feeds into
+            // the mean/covariance accumulation below, so a seam crossing
+            // doesn't inflate the estimated covariance. This only limits the
+            // variance blow-up; it does not make a footprint that genuinely
+            // straddles the seam rasterize on both sides (known limitation).
+            if(i > 0)
+            {
+                const auto period = static_cast<float>(camera_model.parameters.resolution[0]);
+                image_points[i].x -= period * roundf((image_points[i].x - image_points[0].x) / period);
+            }
+        }
+
         image_mean      += mean * image_points[i];
         mean             = rest;
     }
@@ -1929,6 +2029,15 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
         const auto image_mean_vec  = image_points[i] - image_mean;
         image_covariance          += covariance * glm::outerProduct(image_mean_vec, image_mean_vec);
         covariance                 = rest;
+    }
+
+    if constexpr(CameraModel::has_periodic_image_x_axis)
+    {
+        // image_mean was accumulated in the unwrapped domain above (and may
+        // now sit slightly outside [0, width)); wrap it back into the
+        // canonical pixel range expected by the tile-based rasterizer.
+        const auto period = static_cast<float>(camera_model.parameters.resolution[0]);
+        image_mean.x -= period * floorf(image_mean.x / period);
     }
 
     return {image_mean, image_covariance, valid};
@@ -1951,7 +2060,8 @@ using CameraModelWrappers = TypeList<
     CameraModelWrapper<OrthographicCameraModel>,
     CameraModelWrapper<OpenCVPinholeCameraModel>,
     CameraModelWrapper<OpenCVFisheyeCameraModel>,
-    CameraModelWrapper<FThetaCameraModel>
+    CameraModelWrapper<FThetaCameraModel>,
+    CameraModelWrapper<EquirectangularCameraModel>
 >;
 
 // All camera model types: every camera instantiated with every distortion model.

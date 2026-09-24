@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import numpy as np
 from typing import TYPE_CHECKING, Callable, Dict, List, Union
@@ -295,6 +296,42 @@ def reset_opa(
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(
         param_fn, optimizer_fn, params, optimizers, names=["opacities"]
+    )
+
+
+@torch.no_grad()
+def clip_scales(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    max_scale: float,
+):
+    """Inplace clip the (world-space, post-exp) scales to at most ``max_scale``.
+
+    Unlike a mean-based scale regularization loss, this guarantees a hard
+    per-Gaussian ceiling regardless of population size: a small fraction of
+    outlier Gaussians growing very large barely moves a population-mean
+    penalty, but still needs to be capped directly.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        max_scale: The maximum allowed scale, in world-space (post-exp) units.
+    """
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "scales":
+            scales = torch.clamp(p, max=math.log(max_scale))
+            return torch.nn.Parameter(scales, requires_grad=p.requires_grad)
+        else:
+            raise ValueError(f"Unexpected parameter name: {name}")
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.zeros_like(v)
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(
+        param_fn, optimizer_fn, params, optimizers, names=["scales"]
     )
 
 

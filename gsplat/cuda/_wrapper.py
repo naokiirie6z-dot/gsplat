@@ -35,7 +35,9 @@ from gsplat.cuda._lidar import (
 )
 
 ExternalDistortionModelMeta = Literal["bivariate-windshield"]
-CameraModel = Literal["pinhole", "ortho", "fisheye", "ftheta", "lidar"]
+CameraModel = Literal[
+    "pinhole", "ortho", "fisheye", "ftheta", "lidar", "equirectangular"
+]
 
 # Autograd for the migrated ops is attached in Python (torch.library.register_autograd)
 # rather than C++. The C++ module exports only each op's `<op>_fwd` and `<op>_bwd`; the

@@ -208,6 +208,12 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # For MCMCStrategy: hard per-Gaussian scale cap, as a ratio of scene_scale.
+    # Applied automatically when camera_model="equirectangular" (and
+    # strategy.max_scale wasn't explicitly set), where a mean-based scale_reg
+    # loss alone can't stop a small fraction of outlier Gaussians from
+    # growing arbitrarily large.
+    max_scale_ratio: float = 0.1
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -457,6 +463,20 @@ class Runner:
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        if (
+            cfg.camera_model == "equirectangular"
+            and isinstance(cfg.strategy, MCMCStrategy)
+            and cfg.strategy.max_scale is None
+        ):
+            # A mean-based scale_reg loss can't stop a small fraction of
+            # outlier Gaussians from growing arbitrarily large (their
+            # contribution to the population mean is negligible at ~1M
+            # Gaussians), which otherwise shows up as hazy floaters when
+            # viewed from a close-up virtual camera. Only auto-set this if
+            # the user didn't already pass --strategy.max-scale explicitly.
+            cfg.strategy.max_scale = self.scene_scale * cfg.max_scale_ratio
+            print("Auto-set strategy.max_scale:", cfg.strategy.max_scale)
 
         if self.parser.num_cameras > 1 and cfg.batch_size != 1:
             raise ValueError(
@@ -719,6 +739,16 @@ class Runner:
                     .unsqueeze(0)
                 )
 
+        global_z_order = True
+        if camera_model == "equirectangular":
+            # Equirectangular is UT-only and omnidirectional (not
+            # forward-facing): both are hard requirements, not optional
+            # knobs, so set them here rather than relying on the caller to
+            # remember extra CLI flags (mirrors examples/av_trainer.py's
+            # lidar call, which passes global_z_order=False explicitly).
+            with_ut = True
+            global_z_order = False
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -740,6 +770,7 @@ class Runner:
             distributed=self.world_size > 1,
             camera_model=camera_model,
             with_ut=with_ut,
+            global_z_order=global_z_order,
             with_eval3d=self.cfg.with_eval3d,
             ftheta_coeffs=ftheta_coeffs,
             radial_coeffs=radial_coeffs,

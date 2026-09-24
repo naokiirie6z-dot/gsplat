@@ -74,11 +74,12 @@ using mat3x2 = glm::mat<3, 2, float>;
 //
 enum CameraModelType
 {
-    PINHOLE = 0,
-    ORTHO   = 1,
-    FISHEYE = 2,
-    FTHETA  = 3,
-    LIDAR   = 4,
+    PINHOLE         = 0,
+    ORTHO           = 1,
+    FISHEYE         = 2,
+    FTHETA          = 3,
+    LIDAR           = 4,
+    EQUIRECTANGULAR = 5,
 };
 
 enum RendererConfig

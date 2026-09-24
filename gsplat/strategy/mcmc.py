@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 from torch import Tensor
@@ -27,6 +27,7 @@ from .base import Strategy
 from .ops import (
     DEFAULT_MCMC_OPACITY_K,
     DEFAULT_MCMC_OPACITY_T,
+    clip_scales,
     inject_noise_to_position,
     relocate,
     sample_add,
@@ -62,6 +63,13 @@ class MCMCStrategy(Strategy):
             Default to 0.005.
         noise_opacity_k (float): Sharpness of the opacity noise-suppression gate.
             Default to 100.
+        max_scale (Optional[float]): Maximum allowed world-space scale (post-exp)
+            per Gaussian axis. Disabled (None) by default. A mean-based scale
+            regularization loss cannot stop a small fraction of outlier
+            Gaussians from growing arbitrarily large (their contribution to
+            the population mean is negligible), so this provides a hard,
+            per-Gaussian ceiling instead. Gaussians exceeding this are clipped
+            every `refine_every` steps, alongside relocate/add-new-gs.
 
     Examples:
 
@@ -89,6 +97,7 @@ class MCMCStrategy(Strategy):
     verbose: bool = False
     noise_opacity_t: float = DEFAULT_MCMC_OPACITY_T
     noise_opacity_k: float = DEFAULT_MCMC_OPACITY_K
+    max_scale: Optional[float] = None
 
     def initialize_state(self) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
@@ -174,6 +183,14 @@ class MCMCStrategy(Strategy):
                     f"Now having {len(params['means'])} GSs."
                 )
 
+            if self.max_scale is not None:
+                n_clipped = self._clip_scales(params, optimizers)
+                if self.verbose:
+                    print(
+                        f"Step {step}: Clipped {n_clipped} GS scales to "
+                        f"max {self.max_scale}."
+                    )
+
             torch.cuda.empty_cache()
 
         # add noise to GSs (stop after noise_injection_stop_iter if set)
@@ -212,6 +229,24 @@ class MCMCStrategy(Strategy):
                 binoms=binoms,
                 min_opacity=self.min_opacity,
                 scene=scene,
+            )
+        return n_gs
+
+    @torch.no_grad()
+    def _clip_scales(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+    ) -> int:
+        assert self.max_scale is not None
+        scales = torch.exp(params["scales"])
+        n_gs = (scales > self.max_scale).any(dim=-1).sum().item()
+        if n_gs > 0:
+            clip_scales(
+                params=params,
+                optimizers=optimizers,
+                state={},
+                max_scale=self.max_scale,
             )
         return n_gs
 

@@ -388,11 +388,23 @@ void launch_projection_ut_3dgs_fused_kernel(
             TORCH_CHECK(lidar_coeffs.has_value(), "Lidar coefficients must be given for lidar camera model");
             return RowOffsetStructuredSpinningLidarModel::KernelParameters{*lidar_coeffs.value()};
         }
+        else if(camera_model == CameraModelType::EQUIRECTANGULAR)
+        {
+            // No Ks: equirectangular's projection is a pure function of
+            // resolution (same pattern as FTheta's shared Ks-ignoring
+            // structure, except equirectangular needs no extra pointer at all).
+            return to_sensor_model_kernel_params(
+                get_camera_model_kernel_params<EquirectangularCameraModel>(
+                    {image_width, image_height}, rs_type, external_distortion_kernel_params
+                )
+            );
+        }
         else
         {
             TORCH_CHECK(
                 false,
-                "Invalid camera model: only pinhole, ortho, fisheye, ftheta, and lidar camera models are supported"
+                "Invalid camera model: only pinhole, ortho, fisheye, ftheta, lidar, and equirectangular camera "
+                "models are supported"
             );
         }
     }();
@@ -402,13 +414,17 @@ void launch_projection_ut_3dgs_fused_kernel(
 
     // Near/far cull depth. Signed camera-space z unless Euclidean depth sorting
     // is requested, in which case:
-    //  - LiDAR and FTheta: radial. Their projection accepts rays with z <= 0, so
-    //    a signed-z cull would drop centres they can still image.
+    //  - LiDAR, FTheta, and Equirectangular: radial. Their projection accepts
+    //    rays with z <= 0, so a signed-z cull would drop centres they can
+    //    still image (equirectangular is omnidirectional: every ray maps to
+    //    some pixel).
     //  - every other model: still signed z. Its projection rejects z <= 0 rays.
     // This is per model, not per calibration: a max_angle <= pi/2 FTheta fit
     // images nothing behind the plane but still takes the radial branch.
     const bool use_radial_culling
-        = !global_z_order && (camera_model == CameraModelType::LIDAR || camera_model == CameraModelType::FTHETA);
+        = !global_z_order
+        && (camera_model == CameraModelType::LIDAR || camera_model == CameraModelType::FTHETA
+            || camera_model == CameraModelType::EQUIRECTANGULAR);
 
     auto launch_kernel = [&]<typename SensorModel>()
     {

@@ -506,6 +506,28 @@ __device__ __forceinline__ WorldRay compute_world_ray(
             CameraModel camera_model(kernel_params, iid);
             ray = camera_model.element_to_world_ray_shutter_pose(j, i, rs_params);
         }
+        else if(camera_model_type == CameraModelType::EQUIRECTANGULAR)
+        {
+            // No Ks: equirectangular's projection is a pure function of resolution.
+            if(external_distortion_device_params.has_value())
+            {
+                using CameraModel = EquirectangularCameraModel<extdist::BivariateWindshieldModel>;
+                CameraModel::KernelParameters kernel_params = {
+                    {{image_width, image_height}, rs_type, *external_distortion_device_params},
+                };
+                CameraModel camera_model(kernel_params, iid);
+                ray = camera_model.element_to_world_ray_shutter_pose(j, i, rs_params);
+            }
+            else
+            {
+                using CameraModel = EquirectangularCameraModel<extdist::EmptyExternalDistortionModel>;
+                CameraModel::KernelParameters kernel_params = {
+                    {{image_width, image_height}, rs_type, {}},
+                };
+                CameraModel camera_model(kernel_params, iid);
+                ray = camera_model.element_to_world_ray_shutter_pose(j, i, rs_params);
+            }
+        }
         else
         {
             assert(false);
